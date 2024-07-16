@@ -1,0 +1,237 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "CloudFormation template for the AWS Batch setup for Toxic Performance Script."
+
+Parameters:
+  VPCId:
+    Description: "The ID of the VPC where AWS Batch resources will be created."
+    Type: AWS::EC2::VPC::Id
+
+  SubnetIds:
+    Description: "Comma-separated list of subnet IDs"
+    Type: CommaDelimitedList
+
+  SecurityGroupId:
+    Description: "The ID of the existing security group for AWS Batch resources."
+    Type: AWS::EC2::SecurityGroup::Id
+
+  CreateLogGroup:
+    Description: "Flag to determine if the log group should be created"
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+
+  ImageUri:
+    Description: "The URI of the Docker image built by CodeBuild"
+    Type: String
+
+  ExistingEventBridgeRoleName:
+    Description: "The name of an existing EventBridge role to use."
+    Type: String
+
+Conditions:
+  ShouldCreateLogGroup: !Equals [!Ref CreateLogGroup, "true"]
+
+Resources:
+  BatchEventBridgeRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-BatchEvtRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: "BatchInvokePolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "batch:SubmitJob"
+                Resource: "*"
+        - PolicyName: "SSMParameterAccess"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "ssm:GetParameter"
+                  - "ssm:GetParameters"
+                  - "ssm:GetParametersByPath"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/*"
+
+  ECSTaskExecutionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-ECSTaskRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+        - PolicyName: "ECSTaskExecutionPolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "ecr:GetAuthorizationToken"
+                  - "ecr:BatchCheckLayerAvailability"
+                  - "ecr:GetDownloadUrlForLayer"
+                  - "ecr:BatchGetImage"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: "*"
+        - PolicyName: "ECSJobPolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "s3:GetObject"
+                  - "s3:ListBucket"
+                  - "ssm:GetParameter"
+                  - "ssm:GetParameters"
+                  - "ssm:GetParametersByPath"
+                Resource: "*"
+
+  BatchComputeEnvironment:
+    Type: "AWS::Batch::ComputeEnvironment"
+    Properties:
+      Type: MANAGED
+      ServiceRole: "arn:aws:iam::203785037565:role/ToxicPerformanceAWSBatchServiceRole"
+      ComputeEnvironmentName: !Sub "${AWS::StackName}-Compute-${AWS::Region}"
+      ComputeResources:
+        Type: "FARGATE"
+        MaxvCpus: 4
+        SecurityGroupIds:
+          - !Ref SecurityGroupId
+        Subnets: !Ref SubnetIds
+      State: "ENABLED"
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+
+  BatchJobQueue:
+    Type: "AWS::Batch::JobQueue"
+    DependsOn: BatchComputeEnvironment
+    Properties:
+      ComputeEnvironmentOrder:
+        - Order: 1
+          ComputeEnvironment: !Ref BatchComputeEnvironment
+      Priority: 1
+      State: "ENABLED"
+      JobQueueName: !Sub "${AWS::StackName}-JobQueue"
+    UpdateReplacePolicy: Delete
+    DeletionPolicy: Delete
+
+  ToxicPerformanceLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: ShouldCreateLogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/batch/${AWS::StackName}"
+      RetentionInDays: 14
+    UpdateReplacePolicy: Delete
+    DeletionPolicy: Delete
+
+  BatchJobDefinition:
+    Type: "AWS::Batch::JobDefinition"
+    DependsOn: ECSTaskExecutionRole
+    Properties:
+      Type: "container"
+      JobDefinitionName: !Sub "${AWS::StackName}-JobDef"
+      PlatformCapabilities:
+        - "FARGATE"
+      ContainerProperties:
+        Image: !Ref ImageUri
+        ResourceRequirements:
+          - Type: "VCPU"
+            Value: "1"
+          - Type: "MEMORY"
+            Value: "2048"
+        Command:
+          - "python3"
+          - "/app/main.py"
+        ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+        JobRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+        LogConfiguration:
+          LogDriver: "awslogs"
+          Options:
+            awslogs-group:
+              !If [
+                ShouldCreateLogGroup,
+                !Ref ToxicPerformanceLogGroup,
+                !Sub "/aws/batch/${AWS::StackName}",
+              ]
+            awslogs-stream-prefix: "batch"
+        Environment:
+          - Name: "DATABASE_HOST"
+            Value: "{{resolve:ssm:DATABASE_HOST:1}}"
+          - Name: "DATABASE_NAME"
+            Value: "{{resolve:ssm:DATABASE_NAME:1}}"
+          - Name: "DATABASE_PORT"
+            Value: "{{resolve:ssm:DATABASE_PORT:1}}"
+          - Name: "DATABASE_PASSWORD"
+            Value: "{{resolve:ssm:DATABASE_PASSWORD:1}}"
+          - Name: "DATABASE_USER"
+            Value: "{{resolve:ssm:DATABASE_USER:1}}"
+          - Name: "TOXIC_SLACK_API_TOKEN"
+            Value: "{{resolve:ssm:TOXIC_SLACK_API_TOKEN:1}}"
+          - Name: "TOXIC_SLACK_CHANNEL"
+            Value: "{{resolve:ssm:TOXIC_SLACK_CHANNEL:1}}"
+          - Name: "S3_BUCKET_NAME"
+            Value: "{{resolve:ssm:S3_BUCKET_NAME:1}}"
+          - Name: "S3_FILE_KEY"
+            Value: "{{resolve:ssm:S3_FILE_KEY:1}}"
+          - Name: "PKL_FILE_PATH"
+            Value: "{{resolve:ssm:PKL_FILE_PATH:1}}"
+      Timeout:
+        AttemptDurationSeconds: 900
+      RetryStrategy:
+        Attempts: 3
+    UpdateReplacePolicy: Delete
+    DeletionPolicy: Delete
+
+  HandoverEventRuleMorning:
+    Type: "AWS::Events::Rule"
+    DependsOn: [BatchJobQueue, BatchJobDefinition, BatchEventBridgeRole]
+    Properties:
+      Description: "Rule for invoking AWS Batch job at 6 AM CET on Saturdays"
+      ScheduleExpression: "cron(0 5 ? * SAT *)"
+      State: "ENABLED"
+      Targets:
+        - Id: !Sub "${AWS::StackName}-BatchTarget"
+          Arn: !Ref BatchJobQueue
+          RoleArn: !GetAtt BatchEventBridgeRole.Arn
+          BatchParameters:
+            JobDefinition: !Ref BatchJobDefinition
+            JobName: !Sub "${AWS::StackName}-JobExec"
+
+Outputs:
+  BatchJobQueueArn:
+    Description: "ARN of the Batch Job Queue."
+    Value: !GetAtt BatchJobQueue.Arn
+  BatchComputeEnvironmentArn:
+    Description: "ARN of the Batch Compute Environment."
+    Value: !Ref BatchComputeEnvironment
+  VPCId:
+    Description: "VPC used for the Batch resources"
+    Value: !Ref VPCId
+  SubnetIds:
+    Description: "Subnets used for the Batch resources"
+    Value: !Join [",", !Ref SubnetIds]
+  SecurityGroupId:
+    Description: "Security Group used for the Batch resources"
+    Value: !Ref SecurityGroupId
